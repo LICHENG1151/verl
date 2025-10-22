@@ -40,6 +40,7 @@ policy_loss:
 
   # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617
   loss_mode: "vanilla"
+  algo: "PPO"
 
   # Ratio of tokens to be clipped for clip-cov loss
   clip_cov_ratio: 0.0002
@@ -60,7 +61,8 @@ policy_loss:
 clip_ratio_c: 3.0
 
 # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
-loss_agg_mode: token-mean
+loss_agg_mode: "seq-mean-token-sum-norm"
+dtype: float16
 
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
@@ -108,4 +110,6 @@ optim:
   total_training_steps: -1
 
   # Weight decay
-  weight_decay: 0.01
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  eps: 1e-15

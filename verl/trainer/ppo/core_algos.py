@@ -707,8 +707,9 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / torch.sum(loss_mask, dim=-1)  # token-mean
         loss = torch.mean(seq_losses)  # seq-mean
     elif loss_agg_mode == "seq-mean-token-sum-norm":
-        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
-        loss = torch.sum(seq_losses) / loss_mask.shape[-1]  # The divisor
+        # The implementation of Dr.GRPO of verl is wrong, we fix it here.
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / loss_mask.shape[-1]  # The divisor
+        loss = torch.mean(seq_losses)  # seq-mean
         # (loss_mask.shape[-1]) should ideally be constant
         # throughout training to well-replicate the DrGRPO paper.
         # TODO: Perhaps add user-defined normalizer argument to
@@ -721,6 +722,7 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
 
 def compute_policy_loss(
     old_log_prob,
+    rollout_log_prob,
     log_prob,
     advantages,
     response_mask,
@@ -729,6 +731,7 @@ def compute_policy_loss(
     cliprange_high=None,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
+    algo: str = "PPO",
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -782,14 +785,91 @@ def compute_policy_loss(
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
 
-    pg_losses3 = -advantages * clip_ratio_c
-    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
-    )
+    # pg_losses3 = -advantages * clip_ratio_c
+    # clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    # pg_clipfrac_lower = verl_F.masked_mean(
+    #     torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+    # )
+    # pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
-    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    if algo in ["PPO", "PPO-Token-TIS", "PPO-Seq-MIS", "PPO-Seq-TIS"]:
+        log_seq_iw = (old_log_prob - rollout_log_prob) * response_mask
+        log_seq_iw = log_seq_iw.sum(dim=-1, keepdim=True)
+        seq_iw = torch.exp(log_seq_iw.clamp(max=20.0)) # sequence importance weight
+        seq_iw = seq_iw.detach()
+        if algo == "PPO":
+            pg_losses = clip_pg_losses1
+        elif algo == "PPO-Token-TIS":
+            safe_log_token_iw = old_log_prob - rollout_log_prob
+            safe_log_token_iw = safe_log_token_iw.clamp(max=20.0)
+            token_iw = torch.exp(safe_log_token_iw)
+            pg_losses = clip_pg_losses1 * token_iw.clamp(max=clip_ratio_c)
+        elif algo == "PPO-Seq-TIS":
+            pg_losses = clip_pg_losses1 * seq_iw.clamp(max=clip_ratio_c)
+        elif algo == "PPO-Seq-MIS":
+            clip_mask = (seq_iw <= clip_ratio_c).float()
+            pg_losses = clip_pg_losses1 * seq_iw * clip_mask
+        else:
+            raise ValueError(f"Invalid algo: {algo}")
+        pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+        pg_clipfrac_lower = verl_F.masked_mean(
+            torch.gt(seq_iw, clip_ratio_c).float(), response_mask
+        )
+    elif algo in ["PG-Seq-IS", "PG-Seq-TIS", "PG-Seq-MIS"]:
+        log_seq_iw = (log_prob - rollout_log_prob) * response_mask
+        log_seq_iw = log_seq_iw.sum(dim=-1, keepdim=True)
+        seq_iw = torch.exp(log_seq_iw.clamp(max=20.0))  # sequence importance weight
+        seq_iw = seq_iw.detach()
+        prob = torch.exp(log_prob)
+        if algo == "PG-Seq-IS":
+            seq_iw_truncated = seq_iw * log_prob
+        elif algo == "PG-Seq-TIS":
+            seq_iw_truncated = seq_iw.clamp(max=clip_ratio_c) * log_prob
+        elif algo == "PG-Seq-MIS":
+            seq_iw_truncated = (seq_iw * prob / prob.detach()).clamp(max=clip_ratio_c)
+        else:
+            raise ValueError(f"Invalid algo: {algo}")
+        pg_losses = - seq_iw_truncated * advantages
+        pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-sum-norm")
+
+        pg_clipfrac = verl_F.masked_mean(
+            torch.gt(seq_iw, clip_ratio_c).float(), response_mask
+        )
+        pg_clipfrac_lower = verl_F.masked_mean(
+            torch.lt(seq_iw, 1 / clip_ratio_c).float(), response_mask
+        )
+    elif algo in ["Vanilla-GSPO"]:
+        low, high = 1 - 3e-4, 1 + 4e-4
+        log_seq_iw = (log_prob - old_log_prob) * response_mask
+        log_seq_iw = log_seq_iw.sum(dim=-1, keepdim=True)
+        seq_len = response_mask.sum(dim=-1, keepdim=True)
+
+        safe_log_seq_iw = log_seq_iw / seq_len
+        safe_log_seq_iw = safe_log_seq_iw.clamp(max=20.0)
+        geometric_seq_iw = torch.exp(safe_log_seq_iw)
+        geometric_seq_iw = geometric_seq_iw.detach()
+        prob = torch.exp(log_prob)
+        seq_ratio = geometric_seq_iw * prob / prob.detach()
+        pg_losses1 = -advantages * seq_ratio
+        pg_losses2 = -advantages * torch.clamp(
+            seq_ratio, low, high
+        )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+
+        pg_losses = torch.maximum(
+            pg_losses1, pg_losses2
+        )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+
+        agg_mode = "seq-mean-token-mean"
+        pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=agg_mode)
+
+        seq_iw = torch.exp(log_seq_iw)
+        pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+        pg_clipfrac_lower = verl_F.masked_mean(
+            torch.gt(seq_iw, clip_ratio_c).float(), response_mask
+        )
+    else:
+        raise ValueError(f"Invalid algo: {algo}")
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 

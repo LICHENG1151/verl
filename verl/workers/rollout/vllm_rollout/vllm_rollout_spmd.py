@@ -41,13 +41,14 @@ import ray
 import torch
 import torch.distributed
 import zmq
+import vllm
 from filelock import FileLock
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+# from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
@@ -138,10 +139,11 @@ class vLLMRollout(BaseRollout):
         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
 
         if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
-            raise ValueError(
-                "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
-                             please increase max_num_batched_tokens or disable chunked prefill"
-            )
+            max_num_batched_tokens = max_model_len
+            # raise ValueError(
+            #     "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
+            #                  please increase max_num_batched_tokens or disable chunked prefill"
+            # )
 
         trust_remote_code = kwargs.get("trust_remote_code", False)
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
@@ -162,6 +164,9 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
+        rank = torch.distributed.get_rank()
+        print(f"rank: {rank}, dtype: {config.dtype}, model_path: {model_path}")
+
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -179,7 +184,7 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
-            seed=config.get("seed", 0),
+            seed=config.get("seed", 42),
             **lora_kwargs,
             **engine_kwargs,
         )
@@ -187,6 +192,8 @@ class vLLMRollout(BaseRollout):
         # Offload vllm model to reduce peak memory usage
         if config.free_cache_engine:
             self.inference_engine.sleep(level=1)
+
+        self.inference_engine.apply_model(lambda model: print(model.__class__))
 
         kwargs = dict(
             n=1,
@@ -391,7 +398,7 @@ def _monkey_patch_compute_logits(model, vocab_size: int):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
+        sampling_metadata,
     ) -> torch.Tensor:
         logits = original_compute_logits(hidden_states, sampling_metadata)
         logits[..., vocab_size:] = float("-inf")

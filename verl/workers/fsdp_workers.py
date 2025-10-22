@@ -243,11 +243,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 self.tokenizer.chat_template = self.config.model.custom_chat_template
 
+        vllm_dtype = PrecisionType.to_dtype(self.config.rollout.dtype)
         torch_dtype = fsdp_config.get("model_dtype", None)
         if torch_dtype is None:
-            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            torch_dtype = torch.float32 if self._is_actor else vllm_dtype
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        print(f"torch_dtype: {torch_dtype}")
 
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(
@@ -293,7 +295,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if use_liger:
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
 
-                _apply_liger_kernel_to_instance(model=actor_module)
+                _apply_liger_kernel_to_instance(model=actor_module, fused_linear_cross_entropy=False)
 
             fused_kernel_options = self.config.model.get("fused_kernel_options", None)
             fused_kernels_backend = (
@@ -340,9 +342,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
             buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
         else:
-            param_dtype = torch.bfloat16
+            param_dtype = PrecisionType.to_dtype(self.config.actor.get("dtype", "float16"))
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
+
+        print(f"param_dtype: {param_dtype}, reduce_dtype: {reduce_dtype}, buffer_dtype: {buffer_dtype}")
 
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
@@ -415,11 +419,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
+            betas = optim_config.get("betas", (0.9, 0.95))
+            eps = optim_config.get("eps", 1e-15)
+            weight_decay = optim_config.get("weight_decay", 1e-2)
+            print(f"betas: {betas}, eps: {eps}, weight_decay: {weight_decay}, lr: {optim_config.lr}")
             actor_optimizer = optim.AdamW(
                 actor_module_fsdp.parameters(),
                 lr=optim_config.lr,
-                betas=optim_config.get("betas", (0.9, 0.999)),
-                weight_decay=optim_config.get("weight_decay", 1e-2),
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
             )
 
             total_steps = optim_config.get("total_training_steps", 0)
@@ -672,6 +681,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
+        output = self._update_actor(data)
+        get_torch_device().empty_cache()
+        return output
+
+    def _update_actor(self, data: DataProto):
         # Support all hardwares
         data = data.to(get_device_id())
 

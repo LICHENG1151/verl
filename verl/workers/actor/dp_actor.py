@@ -17,12 +17,14 @@
 Single Process Actor
 """
 
+from contextlib import nullcontext
 import logging
 import os
-
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -76,6 +78,11 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        assert self.config.dtype in ["float16", "float32", "bfloat16"]
+        if self.config.dtype == "float16":
+            self.scaler = ShardedGradScaler(growth_interval=400)
+        else:
+            self.scaler = None
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
@@ -97,7 +104,10 @@ class DataParallelPPOActor(BasePPOActor):
                         [inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0
                     )
 
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+        from verl.utils.torch_dtypes import PrecisionType
+        torch_dtype = PrecisionType.to_dtype(self.config.dtype)
+        with torch.autocast(device_type=self.device_name, dtype=torch_dtype):
+        # with nullcontext():
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
@@ -190,6 +200,7 @@ class DataParallelPPOActor(BasePPOActor):
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
                     )
+                    # print(f"logits dtype: {logits_rmpad.dtype}, log_probs dtype: {log_probs.dtype}")  # bf16, fp32
 
                     # compute entropy
                     if calculate_entropy:
@@ -272,6 +283,8 @@ class DataParallelPPOActor(BasePPOActor):
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
+        if self.scaler is not None:
+            self.scaler.unscale_(self.actor_optimizer)
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):
@@ -279,12 +292,17 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
 
-        # if grad_norm is not finite, skip the update
-        if not torch.isfinite(grad_norm):
-            print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
-            self.actor_optimizer.zero_grad()
+        if self.scaler is not None:
+            self.scaler.step(self.actor_optimizer)
+            self.scaler.update()
         else:
-            self.actor_optimizer.step()
+            # if grad_norm is not finite, skip the update
+            if not torch.isfinite(grad_norm):
+                print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
+                self.actor_optimizer.zero_grad()
+            else:
+                self.actor_optimizer.step()
+
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -362,6 +380,7 @@ class DataParallelPPOActor(BasePPOActor):
             "attention_mask",
             "position_ids",
             "old_log_probs",
+            "rollout_log_probs",
             "advantages",
         ]
         if self.config.use_kl_loss:
@@ -370,14 +389,20 @@ class DataParallelPPOActor(BasePPOActor):
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
-        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
-
-        # Split to make minibatch iterator for updating the actor
-        # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        print(f"batch_size: {len(data.batch)}, mini_batch_size: {self.config.ppo_mini_batch_size}")
+        original_data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):
+            if self.use_ulysses_sp:
+                shuffled_data = original_data
+            else:
+                indices = np.random.permutation(len(original_data.batch))
+                shuffled_data = original_data.select_idxs(indices)
+            # Split to make minibatch iterator for updating the actor
+            # See PPO paper for details. https://arxiv.org/abs/1707.06347
+            mini_batches = shuffled_data.split(self.config.ppo_mini_batch_size)
+
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -395,6 +420,7 @@ class DataParallelPPOActor(BasePPOActor):
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
+                    rollout_log_prob = model_inputs["rollout_log_probs"]
                     advantages = model_inputs["advantages"]
 
                     clip_ratio = self.config.clip_ratio
@@ -417,10 +443,12 @@ class DataParallelPPOActor(BasePPOActor):
                     )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                    algo = self.config.policy_loss.get("algo", "PPO")
 
                     if self.config.policy_loss.loss_mode == "vanilla":
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                             old_log_prob=old_log_prob,
+                            rollout_log_prob=rollout_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
                             response_mask=response_mask,
@@ -429,6 +457,7 @@ class DataParallelPPOActor(BasePPOActor):
                             cliprange_high=clip_ratio_high,
                             clip_ratio_c=clip_ratio_c,
                             loss_agg_mode=loss_agg_mode,
+                            algo=algo,
                         )
 
                     else:
@@ -467,7 +496,27 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (response_mask.shape[0] / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
-                    loss.backward()
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+
+                    probs_diff = torch.exp(log_prob) - torch.exp(old_log_prob)
+                    probs_diff = probs_diff * response_mask
+                    probs_diff_abs = torch.abs(probs_diff)
+                    probs_diff_max = torch.max(probs_diff)
+                    probs_diff_min = torch.min(probs_diff)
+                    probs_diff_mean = torch.mean(probs_diff_abs)
+                    probs_diff_std = torch.std(probs_diff_abs)
+                    log_probs_diff = log_prob - old_log_prob
+                    log_probs_diff = log_probs_diff * response_mask
+                    log_probs_diff_max = torch.max(log_probs_diff)
+                    log_probs_diff_min = torch.min(log_probs_diff)
+                    seq_iw = ((log_prob - rollout_log_prob) * response_mask).sum(dim=-1)
+                    log_seq_iw_max = torch.max(seq_iw)
+                    log_seq_iw_min = torch.min(seq_iw)
+                    log_seq_iw_mean = torch.mean(torch.abs(seq_iw))
+                    log_seq_iw_std = torch.std(torch.abs(seq_iw))
 
                     micro_batch_metrics.update(
                         {
@@ -475,12 +524,30 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                             "actor/ppo_kl": ppo_kl.detach().item(),
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            "actor/probs_diff_max": probs_diff_max.detach().item(),
+                            "actor/probs_diff_min": probs_diff_min.detach().item(),
+                            "actor/probs_diff_mean": probs_diff_mean.detach().item(),
+                            "actor/probs_diff_std": probs_diff_std.detach().item(),
+                            "actor/log_probs_diff_max": log_probs_diff_max.detach().item(),
+                            "actor/log_probs_diff_min": log_probs_diff_min.detach().item(),
+                            "actor/log_seq_iw_max": log_seq_iw_max.detach().item(),
+                            "actor/log_seq_iw_min": log_seq_iw_min.detach().item(),
+                            "actor/log_seq_iw_mean": log_seq_iw_mean.detach().item(),
+                            "actor/log_seq_iw_std": log_seq_iw_std.detach().item(),
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+
+                weights_l2_norm = 0.0
+                for param in self.actor_module.parameters():
+                    if param.requires_grad:
+                        weights_l2_norm += torch.norm(param.detach(), p=2).item() ** 2
+                # weights_l2_norm = weights_l2_norm ** 0.5
+                mini_batch_metrics["actor/weights_l2_norm"] = weights_l2_norm
+
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
