@@ -37,6 +37,10 @@ def main(config):
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
+    # import debugpy
+    # debugpy.listen(("127.0.0.1", 5678))
+    # print("Waiting for debugpy ...")
+    # debugpy.wait_for_client()
     run_ppo(config)
 
 

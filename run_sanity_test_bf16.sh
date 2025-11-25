@@ -6,11 +6,13 @@ if [ -z "$MODEL_PATH" ]; then
 fi
 
 if [ -z "$ALGO" ]; then
-    ALGO=PPO-Token-TIS
+    # ALGO=PPO-Token-TIS
+    ALGO=PG-Seq-IS
 fi
 
 if [ -z "$DTYPE" ]; then
-    DTYPE=float16
+    # DTYPE=float16
+    DTYPE=bfloat16
 fi
 
 if [ -z "$LOSS_AGG_MODE" ]; then
@@ -36,7 +38,7 @@ RAY_DEDUP_LOGS=0 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.n=32 \
     trainer.project_name=precision-rl \
-    trainer.experiment_name=sanity_test-$DTYPE-$ALGO \
+    trainer.experiment_name=sanity_test-$DTYPE-$ALGO-8-gpu \
     trainer.val_before_train=True \
     trainer.total_epochs=20 \
     trainer.n_gpus_per_node=8 "${@:1}"
