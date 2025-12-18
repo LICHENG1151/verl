@@ -38,7 +38,7 @@ RAY_DEDUP_LOGS=0 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=2 \
     actor_rollout_ref.rollout.val_kwargs.n=32 \
     trainer.project_name=precision-rl \
-    trainer.experiment_name=sanity_test-$DTYPE-$ALGO \
+    trainer.experiment_name=sanity_test-$DTYPE-$ALGO-test \
     trainer.val_before_train=True \
     trainer.total_epochs=20 \
     trainer.n_gpus_per_node=2 "${@:1}"

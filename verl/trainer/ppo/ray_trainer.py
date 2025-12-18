@@ -1121,6 +1121,7 @@ class RayPPOTrainer:
         old_log_prob.batch.pop("entropys")
         batch = batch.union(old_log_prob)
 
+        # Cheng's TODO: Compute the correlation between old_log_probs and rollout_log_probs
         if "rollout_log_probs" in batch.batch.keys():
             rollout_old_log_probs = batch.batch["rollout_log_probs"]
             actor_old_log_probs = batch.batch["old_log_probs"]
